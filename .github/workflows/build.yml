@@ -1,87 +1,195 @@
-name: Build IPA
+
+name: Build Telegram IPA
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-ipa-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 360
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
 
-      - name: Fetch submodules from TelegramMessenger
+      - name: Fetch submodules
         run: |
-          git config --global url."https://github.com/TelegramMessenger/".insteadOf "https://github.com/${{ github.repository_owner }}/"
+          git config --global \
+            url."https://github.com/TelegramMessenger/".insteadOf \
+            "https://github.com/${{ github.repository_owner }}/"
+
           git submodule update --init --recursive
 
-      - name: Show required versions
-        run: cat versions.json
-
-      - name: Select newest installed Xcode
+      - name: Select installed Xcode
+        shell: bash
         run: |
-          echo "Telegram wants Xcode $(jq -r '.xcode' versions.json)"
-          ls /Applications | grep -i xcode || true
-          XC=$(ls /Applications | grep -E '^Xcode_[0-9.]+\.app$' | sed -E 's/^Xcode_(.*)\.app$/\1/' | sort -V | tail -1)
-          echo "Using Xcode $XC"
-          sudo xcode-select -s "/Applications/Xcode_${XC}.app"
+          set -euo pipefail
+
+          echo "Available Xcode installations:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+
+          XC_PATH=$(
+            find /Applications -maxdepth 1 \
+              -type d -name 'Xcode_*.app' |
+              sort -V | tail -n 1
+          )
+
+          if [ -z "$XC_PATH" ]; then
+            XC_PATH="/Applications/Xcode.app"
+          fi
+
+          if [ ! -d "$XC_PATH" ]; then
+            echo "::error::No Xcode installation found"
+            exit 1
+          fi
+
+          sudo xcode-select -s "$XC_PATH/Contents/Developer"
+          sudo xcodebuild -license accept
+
           xcodebuild -version
-          REAL=$(xcodebuild -version | head -1 | awk '{print $2}')
-          jq --arg v "$REAL" '.xcode=$v' versions.json > versions.tmp && mv versions.tmp versions.json
-          cat versions.json
 
-      - name: Install Bazel from versions.json
+          REAL_XCODE=$(xcodebuild -version |
+            awk '/^Xcode / {print $2}')
+
+          jq --arg v "$REAL_XCODE" \
+            '.xcode=$v' versions.json > versions.tmp
+
+          mv versions.tmp versions.json
+
+      - name: Install Bazel
+        shell: bash
         run: |
-          BZ=$(jq -r '.bazel' versions.json)
-          echo "Need Bazel $BZ"
-          curl -L -o bazel "https://github.com/bazelbuild/bazel/releases/download/${BZ}/bazel-${BZ}-darwin-arm64"
+          set -euo pipefail
+
+          BAZEL_INFO=$(jq -r '.bazel' versions.json)
+          BAZEL_VERSION="${BAZEL_INFO%%:*}"
+          EXPECTED_SHA="${BAZEL_INFO#*:}"
+          ARCH=$(uname -m)
+
+          case "$ARCH" in
+            arm64) BAZEL_ARCH="arm64" ;;
+            x86_64) BAZEL_ARCH="x86_64" ;;
+            *)
+              echo "::error::Unsupported architecture: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          URL="https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-${BAZEL_ARCH}"
+
+          echo "Installing Bazel $BAZEL_VERSION ($BAZEL_ARCH)"
+
+          curl --fail --show-error --location --retry 3 \
+            "$URL" -o bazel
+
+          if [[ "$EXPECTED_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "$EXPECTED_SHA  bazel" | shasum -a 256 -c -
+          fi
+
           chmod +x bazel
           sudo mv bazel /usr/local/bin/bazel
+
           bazel --version
 
       - name: Create build configuration
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        shell: bash
         run: |
-          jq --arg id "$TG_API_ID" --arg hash "$TG_API_HASH" \
-            '.api_id=$id | .api_hash=$hash' \
-            build-system/template_minimal_development_configuration.json > config.json
+          set -euo pipefail
 
-      - name: Diagnose
-        continue-on-error: true
-        run: |
-          echo "=== template config ==="
-          cat build-system/template_minimal_development_configuration.json
-          echo "=== fake-codesigning ==="
-          ls -R build-system/fake-codesigning | head -60
-          echo "=== where aps-environment is checked ==="
-          grep -rn "aps-environment" build-system/Make/ || true
-          echo "=== build options ==="
-          python3 build-system/Make/Make.py build --help 2>&1 | head -80 || true
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Set TG_API_ID and TG_API_HASH in repository Actions secrets"
+            exit 1
+          fi
 
-      - name: Build
+          jq --arg id "$TG_API_ID" \
+             --arg hash "$TG_API_HASH" \
+             '.api_id=$id | .api_hash=$hash' \
+             build-system/template_minimal_development_configuration.json \
+             > config.json
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('versions.json', '**/MODULE.bazel', '**/MODULE.bazel.lock', '**/WORKSPACE', '**/WORKSPACE.bazel', '**/*.bzl') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build IPA
+        shell: bash
         run: |
-          BASE="python3 build-system/Make/Make.py --cacheDir=$HOME/telegram-bazel-cache build --configurationPath=config.json --codesigningInformationPath=build-system/fake-codesigning --buildNumber=100001 --configuration=release_arm64"
-          echo "=== Attempt 1: default ==="
-          $BASE || {
-            echo "=== Attempt 2: --disableProvisioningProfiles ==="
-            $BASE --disableProvisioningProfiles || {
-              echo "=== Attempt 3: --disableProvisioningProfiles --disableExtensions ==="
-              $BASE --disableProvisioningProfiles --disableExtensions
-            }
-          }
+          set -uo pipefail
+
+          BUILD_ARGS=(
+            build-system/Make/Make.py
+            --cacheDir="$HOME/telegram-bazel-cache"
+            build
+            --configurationPath=config.json
+            --codesigningInformationPath=build-system/fake-codesigning
+            --buildNumber="${GITHUB_RUN_NUMBER}"
+            --configuration=release_arm64
+          )
+
+          echo "Attempt 1: default build"
+          if python3 "${BUILD_ARGS[@]}"; then
+            echo "Build succeeded"
+          else
+            echo "Attempt 2: disable provisioning profiles"
+            if python3 "${BUILD_ARGS[@]}" \
+              --disableProvisioningProfiles; then
+              echo "Build succeeded"
+            else
+              echo "Attempt 3: disable provisioning profiles and extensions"
+              python3 "${BUILD_ARGS[@]}" \
+                --disableProvisioningProfiles \
+                --disableExtensions || exit 1
+            fi
+          fi
 
       - name: Collect IPA
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p out
-          find bazel-bin -name "*.ipa" -exec cp {} out/ \;
-          ls -la out
+
+          find . \
+            -type f \
+            -name '*.ipa' \
+            -not -path './.git/*' \
+            -not -path './out/*' \
+            -exec cp {} out/ \;
+
+          if ! find out -maxdepth 1 -type f \
+            -name '*.ipa' | grep -q .; then
+            echo "::error::Build finished but no IPA was found"
+            exit 1
+          fi
+
+          ls -lh out/
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ipa
+          name: Telegram-IPA-${{ github.run_number }}
           path: out/*.ipa
+          if-no-files-found: error
+          retention-days: 7
