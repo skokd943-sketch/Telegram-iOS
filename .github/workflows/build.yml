@@ -50,15 +50,29 @@ jobs:
             '.api_id=$id | .api_hash=$hash' \
             build-system/template_minimal_development_configuration.json > config.json
 
+      - name: Diagnose
+        continue-on-error: true
+        run: |
+          echo "=== template config ==="
+          cat build-system/template_minimal_development_configuration.json
+          echo "=== fake-codesigning ==="
+          ls -R build-system/fake-codesigning | head -60
+          echo "=== where aps-environment is checked ==="
+          grep -rn "aps-environment" build-system/Make/ || true
+          echo "=== build options ==="
+          python3 build-system/Make/Make.py build --help 2>&1 | head -80 || true
+
       - name: Build
         run: |
-          python3 build-system/Make/Make.py \
-            --cacheDir="$HOME/telegram-bazel-cache" \
-            build \
-            --configurationPath=config.json \
-            --codesigningInformationPath=build-system/fake-codesigning \
-            --buildNumber=100001 \
-            --configuration=release_arm64
+          BASE="python3 build-system/Make/Make.py --cacheDir=$HOME/telegram-bazel-cache build --configurationPath=config.json --codesigningInformationPath=build-system/fake-codesigning --buildNumber=100001 --configuration=release_arm64"
+          echo "=== Attempt 1: default ==="
+          $BASE || {
+            echo "=== Attempt 2: --disableProvisioningProfiles ==="
+            $BASE --disableProvisioningProfiles || {
+              echo "=== Attempt 3: --disableProvisioningProfiles --disableExtensions ==="
+              $BASE --disableProvisioningProfiles --disableExtensions
+            }
+          }
 
       - name: Collect IPA
         run: |
