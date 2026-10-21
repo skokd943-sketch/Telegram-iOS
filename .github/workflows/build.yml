@@ -47,7 +47,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
           jq --arg id "$TG_API_ID" --arg hash "$TG_API_HASH" \
-            '.api_id=$id | .api_hash=$hash | .bundle_id="org.myfork.messenger"' \
+            '.api_id=$id | .api_hash=$hash' \
             build-system/template_minimal_development_configuration.json > config.json
 
       - name: Build
