@@ -1,18 +1,18 @@
 
-name: Build Telegram IPA
+name: Build Telegram iOS IPA
 
 on:
   workflow_dispatch:
   push:
     branches:
       - master
-  workflow_call:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: telegram-ipa-${{ github.ref }}
+  group: telegram-ios-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,163 +24,104 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: recursive
           fetch-depth: 1
 
-      - name: Fetch submodules
+      - name: Show environment
         run: |
-          git config --global \
-            url."https://github.com/TelegramMessenger/".insteadOf \
-            "https://github.com/${{ github.repository_owner }}/"
+          sw_vers
+          uname -m
+          xcodebuild -version
+          git submodule status
 
-          git submodule update --init --recursive
-
-      - name: Select installed Xcode
+      - name: Read Bazel version
+        id: versions
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Available Xcode installations:"
-          ls -d /Applications/Xcode*.app 2>/dev/null || true
-
-          XC_PATH=$(
-            find /Applications -maxdepth 1 \
-              -type d -name 'Xcode_*.app' |
-              sort -V | tail -n 1
-          )
-
-          if [ -z "$XC_PATH" ]; then
-            XC_PATH="/Applications/Xcode.app"
-          fi
-
-          if [ ! -d "$XC_PATH" ]; then
-            echo "::error::No Xcode installation found"
-            exit 1
-          fi
-
-          sudo xcode-select -s "$XC_PATH/Contents/Developer"
-          sudo xcodebuild -license accept
-
-          xcodebuild -version
-
-          REAL_XCODE=$(xcodebuild -version |
-            awk '/^Xcode / {print $2}')
-
-          jq --arg v "$REAL_XCODE" \
-            '.xcode=$v' versions.json > versions.tmp
-
-          mv versions.tmp versions.json
+          BAZEL="$(jq -r '.bazel | split(":")[0]' versions.json)"
+          echo "bazel=$BAZEL" >> "$GITHUB_OUTPUT"
+          echo "Bazel version: $BAZEL"
 
       - name: Install Bazel
         shell: bash
         run: |
           set -euo pipefail
+          BAZEL="${{ steps.versions.outputs.bazel }}"
 
-          BAZEL_INFO=$(jq -r '.bazel' versions.json)
-          BAZEL_VERSION="${BAZEL_INFO%%:*}"
-          EXPECTED_SHA="${BAZEL_INFO#*:}"
-          ARCH=$(uname -m)
-
-          case "$ARCH" in
-            arm64) BAZEL_ARCH="arm64" ;;
-            x86_64) BAZEL_ARCH="x86_64" ;;
-            *)
-              echo "::error::Unsupported architecture: $ARCH"
-              exit 1
-              ;;
+          case "$(uname -m)" in
+            arm64) ARCH=arm64 ;;
+            x86_64) ARCH=x86_64 ;;
+            *) echo "::error::Unsupported CPU architecture"; exit 1 ;;
           esac
 
-          URL="https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-${BAZEL_ARCH}"
-
-          echo "Installing Bazel $BAZEL_VERSION ($BAZEL_ARCH)"
-
-          curl --fail --show-error --location --retry 3 \
-            "$URL" -o bazel
-
-          if [[ "$EXPECTED_SHA" =~ ^[a-fA-F0-9]{64}$ ]]; then
-            echo "$EXPECTED_SHA  bazel" | shasum -a 256 -c -
-          fi
-
+          URL="https://github.com/bazelbuild/bazel/releases/download/${BAZEL}/bazel-${BAZEL}-darwin-${ARCH}"
+          curl --fail --location --retry 3 "$URL" -o bazel
           chmod +x bazel
-          sudo mv bazel /usr/local/bin/bazel
-
+          sudo install -m 755 bazel /usr/local/bin/bazel
           bazel --version
-
-      - name: Create build configuration
-        env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
-            echo "::error::Set TG_API_ID and TG_API_HASH in repository Actions secrets"
-            exit 1
-          fi
-
-          jq --arg id "$TG_API_ID" \
-             --arg hash "$TG_API_HASH" \
-             '.api_id=$id | .api_hash=$hash' \
-             build-system/template_minimal_development_configuration.json \
-             > config.json
 
       - name: Cache Bazel
         uses: actions/cache@v4
         with:
-          path: ~/telegram-bazel-cache
-          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('versions.json', '**/MODULE.bazel', '**/MODULE.bazel.lock', '**/WORKSPACE', '**/WORKSPACE.bazel', '**/*.bzl') }}
+          path: |
+            ~/telegram-bazel-cache
+            ~/.cache/bazel
+            ~/Library/Caches/bazel
+          key: bazel-${{ runner.os }}-${{ runner.arch }}-${{ steps.versions.outputs.bazel }}-${{ hashFiles('MODULE.bazel.lock', 'WORKSPACE', 'versions.json') }}
           restore-keys: |
-            bazel-${{ runner.os }}-${{ runner.arch }}-
+            bazel-${{ runner.os }}-${{ runner.arch }}-${{ steps.versions.outputs.bazel }}-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -euo pipefail
+          test -n "$TG_API_ID" || { echo "::error::Missing TG_API_ID secret"; exit 1; }
+          test -n "$TG_API_HASH" || { echo "::error::Missing TG_API_HASH secret"; exit 1; }
+
+          TEMPLATE="build-system/template_minimal_development_configuration.json"
+          test -f "$TEMPLATE" || { echo "::error::Configuration template not found"; exit 1; }
+
+          jq --arg id "$TG_API_ID" --arg hash "$TG_API_HASH" \
+            '.api_id=$id | .api_hash=$hash' "$TEMPLATE" > configuration.json
+
+          python3 -m json.tool configuration.json >/dev/null
 
       - name: Build IPA
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          BUILD_ARGS=(
-            build-system/Make/Make.py
-            --cacheDir="$HOME/telegram-bazel-cache"
-            build
-            --configurationPath=config.json
-            --codesigningInformationPath=build-system/fake-codesigning
-            --buildNumber="${GITHUB_RUN_NUMBER}"
+          python3 build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath=configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber="${GITHUB_RUN_NUMBER}" \
             --configuration=release_arm64
-          )
 
-          echo "Attempt 1: default build"
-          if python3 "${BUILD_ARGS[@]}"; then
-            echo "Build succeeded"
-          else
-            echo "Attempt 2: disable provisioning profiles"
-            if python3 "${BUILD_ARGS[@]}" \
-              --disableProvisioningProfiles; then
-              echo "Build succeeded"
-            else
-              echo "Attempt 3: disable provisioning profiles and extensions"
-              python3 "${BUILD_ARGS[@]}" \
-                --disableProvisioningProfiles \
-                --disableExtensions || exit 1
-            fi
-          fi
-
-      - name: Collect IPA
+      - name: Find IPA
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p out
 
-          find . \
-            -type f \
-            -name '*.ipa' \
+          find . -type f -name '*.ipa' \
             -not -path './.git/*' \
             -not -path './out/*' \
-            -exec cp {} out/ \;
+            -exec cp -f {} out/ \;
 
-          if ! find out -maxdepth 1 -type f \
-            -name '*.ipa' | grep -q .; then
-            echo "::error::Build finished but no IPA was found"
+          if ! find out -maxdepth 1 -name '*.ipa' -print -quit | grep -q .; then
+            echo "::error::IPA was not generated"
+            find . -type f \( -name '*.ipa' -o -name '*.xcarchive' \) \
+              -not -path './.git/*' | head -100
             exit 1
           fi
 
@@ -189,7 +130,7 @@ jobs:
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Telegram-IPA-${{ github.run_number }}
+          name: Telegram-iOS-IPA-${{ github.run_number }}
           path: out/*.ipa
           if-no-files-found: error
           retention-days: 7
