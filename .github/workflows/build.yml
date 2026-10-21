@@ -1,4 +1,3 @@
-
 name: Build Telegram iOS IPA
 
 on:
@@ -21,13 +20,25 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
+      # Do not let checkout resolve relative submodule URLs against this fork.
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
           fetch-depth: 1
 
+      - name: Fetch Telegram submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Relative URLs such as ../tgcalls.git otherwise resolve to
+          # skokd943-sketch/tgcalls, which does not exist.
+          git config --global url."https://github.com/TelegramMessenger/".insteadOf "https://github.com/skokd943-sketch/"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
       - name: Show environment
+        shell: bash
         run: |
           sw_vers
           uname -m
@@ -52,10 +63,11 @@ jobs:
           case "$(uname -m)" in
             arm64) ARCH=arm64 ;;
             x86_64) ARCH=x86_64 ;;
-            *) echo "::error::Unsupported CPU architecture"; exit 1 ;;
+            *) echo "::error::Unsupported CPU architecture: $(uname -m)"; exit 1 ;;
           esac
 
           URL="https://github.com/bazelbuild/bazel/releases/download/${BAZEL}/bazel-${BAZEL}-darwin-${ARCH}"
+          echo "Downloading $URL"
           curl --fail --location --retry 3 "$URL" -o bazel
           chmod +x bazel
           sudo install -m 755 bazel /usr/local/bin/bazel
@@ -81,13 +93,14 @@ jobs:
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        shell: bash
         run: |
           set -euo pipefail
-          test -n "$TG_API_ID" || { echo "::error::Missing TG_API_ID secret"; exit 1; }
-          test -n "$TG_API_HASH" || { echo "::error::Missing TG_API_HASH secret"; exit 1; }
+          test -n "$TG_API_ID" || { echo "::error::Missing TG_API_ID Actions secret"; exit 1; }
+          test -n "$TG_API_HASH" || { echo "::error::Missing TG_API_HASH Actions secret"; exit 1; }
 
           TEMPLATE="build-system/template_minimal_development_configuration.json"
-          test -f "$TEMPLATE" || { echo "::error::Configuration template not found"; exit 1; }
+          test -f "$TEMPLATE" || { echo "::error::Missing configuration template: $TEMPLATE"; exit 1; }
 
           jq --arg id "$TG_API_ID" --arg hash "$TG_API_HASH" \
             '.api_id=$id | .api_hash=$hash' "$TEMPLATE" > configuration.json
@@ -98,6 +111,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out
 
           python3 build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
@@ -105,27 +119,20 @@ jobs:
             --configurationPath=configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --buildNumber="${GITHUB_RUN_NUMBER}" \
-            --configuration=release_arm64
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/out"
 
-      - name: Find IPA
+      - name: Verify IPA
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-
-          find . -type f -name '*.ipa' \
-            -not -path './.git/*' \
-            -not -path './out/*' \
-            -exec cp -f {} out/ \;
-
-          if ! find out -maxdepth 1 -name '*.ipa' -print -quit | grep -q .; then
-            echo "::error::IPA was not generated"
-            find . -type f \( -name '*.ipa' -o -name '*.xcarchive' \) \
-              -not -path './.git/*' | head -100
+          find out -maxdepth 1 -type f -name '*.ipa' -print
+          if ! find out -maxdepth 1 -type f -name '*.ipa' -print -quit | grep -q .; then
+            echo "::error::Build completed but no IPA was found in out/"
+            find . -type f \( -name '*.ipa' -o -name '*.xcarchive' \) -not -path './.git/*' | head -100
             exit 1
           fi
-
-          ls -lh out/
+          ls -lh out/*.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
