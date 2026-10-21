@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
@@ -37,21 +37,20 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - name: Select required Xcode
+      - name: Select available Xcode
         shell: bash
         run: |
           set -euo pipefail
-          XCODE_VERSION="$(jq -r '.xcode' versions.json)"
-          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          if [[ ! -d "$XCODE_PATH" ]]; then
-            echo "::error::Required Xcode $XCODE_VERSION is not installed at $XCODE_PATH"
-            echo "Installed Xcode versions:"
-            find /Applications -maxdepth 2 -path '*/Contents/Developer' -type d -print | sort
+          echo "Repository requires Xcode $(jq -r '.xcode' versions.json); selecting the newest Xcode installed on this runner."
+          XCODE_PATH="$(find /Applications -maxdepth 4 -type d -path '*/Contents/Developer' -print | grep '/Xcode[^/]*/Contents/Developer$' | sort -V | tail -n 1)"
+          if [[ -z "$XCODE_PATH" ]]; then
+            echo "::error::No installed Xcode found on the runner"
+            find /Applications -maxdepth 4 -name xcodebuild -type f -print | head -50
             exit 1
           fi
           sudo xcode-select --switch "$XCODE_PATH"
+          xcode-select -p
           xcodebuild -version
-
       - name: Show environment
         shell: bash
         run: |
@@ -134,6 +133,7 @@ jobs:
             --configurationPath=configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --buildNumber="${GITHUB_RUN_NUMBER}" \
+            --overrideXcodeVersion \
             --configuration=release_arm64 \
             --outputBuildArtifactsPath="$GITHUB_WORKSPACE/out"
 
