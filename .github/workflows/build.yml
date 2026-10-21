@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 360
 
     steps:
@@ -36,6 +36,21 @@ jobs:
           git config --global url."https://github.com/TelegramMessenger/".insteadOf "https://github.com/skokd943-sketch/"
           git submodule sync --recursive
           git submodule update --init --recursive
+
+      - name: Select required Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(jq -r '.xcode' versions.json)"
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          if [[ ! -d "$XCODE_PATH" ]]; then
+            echo "::error::Required Xcode $XCODE_VERSION is not installed at $XCODE_PATH"
+            echo "Installed Xcode versions:"
+            find /Applications -maxdepth 2 -path '*/Contents/Developer' -type d -print | sort
+            exit 1
+          fi
+          sudo xcode-select --switch "$XCODE_PATH"
+          xcodebuild -version
 
       - name: Show environment
         shell: bash
