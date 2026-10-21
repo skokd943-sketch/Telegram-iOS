@@ -20,13 +20,17 @@ jobs:
       - name: Show required versions
         run: cat versions.json
 
-      - name: Select Xcode from versions.json
+      - name: Select newest installed Xcode
         run: |
-          XC=$(jq -r '.xcode' versions.json)
-          echo "Need Xcode $XC"
+          echo "Telegram wants Xcode $(jq -r '.xcode' versions.json)"
           ls /Applications | grep -i xcode || true
+          XC=$(ls /Applications | grep -E '^Xcode_[0-9.]+\.app$' | sed -E 's/^Xcode_(.*)\.app$/\1/' | sort -V | tail -1)
+          echo "Using Xcode $XC"
           sudo xcode-select -s "/Applications/Xcode_${XC}.app"
           xcodebuild -version
+          REAL=$(xcodebuild -version | head -1 | awk '{print $2}')
+          jq --arg v "$REAL" '.xcode=$v' versions.json > versions.tmp && mv versions.tmp versions.json
+          cat versions.json
 
       - name: Install Bazel from versions.json
         run: |
