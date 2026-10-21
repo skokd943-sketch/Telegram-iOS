@@ -9,10 +9,13 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Fetch submodules from TelegramMessenger
+        run: |
+          git config --global url."https://github.com/TelegramMessenger/".insteadOf "https://github.com/${{ github.repository_owner }}/"
+          git submodule update --init --recursive
 
       - name: Show required versions
         run: cat versions.json
